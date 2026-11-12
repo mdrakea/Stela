@@ -24,8 +24,9 @@ const ESP_TYPES: [&str; 2] = ["c12a7328-f81f-11d2-ba4b-00a0c93ec93b", "0xef"];
 const COLUMNS: &str =
     "NAME,TYPE,SIZE,MODEL,TRAN,RM,RO,MOUNTPOINT,MOUNTPOINTS,PARTTYPE,PARTUUID,PKNAME";
 /// The mount points of the running system's volumes, and swap's.
-const SYSTEM_MOUNTS: [&str; 8] = [
+const SYSTEM_MOUNTS: [&str; 9] = [
     "/",
+    "/sysroot",
     "/boot",
     "/boot/efi",
     "/efi",
@@ -219,8 +220,33 @@ fn run(command: &mut Command) -> Result<()> {
 }
 
 fn require_system_device(devices: &[Device]) -> Result<()> {
+    let mountinfo = fs::read_to_string("/proc/self/mountinfo").unwrap_or_default();
+    require_system_device_with_mountinfo(devices, &mountinfo)
+}
+
+fn require_system_device_with_mountinfo(devices: &[Device], mountinfo: &str) -> Result<()> {
+    // OSTree composefs installations mount the backing filesystem at /sysroot
+    // and present an overlay named composefs at /. Only accept this fallback
+    // when lsblk also identifies the disk holding that backing filesystem.
+    let composefs_root = mountinfo.lines().any(|line| {
+        let Some((mount, filesystem)) = line.split_once(" - ") else {
+            return false;
+        };
+        let fields: Vec<_> = mount.split_whitespace().collect();
+        let mut filesystem = filesystem.split_whitespace();
+        fields.get(4) == Some(&"/")
+            && matches!(
+                (filesystem.next(), filesystem.next()),
+                (Some("composefs"), _) | (_, Some("composefs"))
+            )
+    });
+    fn holds_sysroot(device: &Device) -> bool {
+        device.mounts().any(|mount| mount == "/sysroot")
+            || device.children.iter().any(holds_sysroot)
+    }
     ensure!(
-        devices.iter().any(Device::holds_root),
+        devices.iter().any(Device::holds_root)
+            || composefs_root && devices.iter().any(holds_sysroot),
         "cannot identify the block devices holding the running Linux installation"
     );
     Ok(())
@@ -630,6 +656,27 @@ mod tests {
         listing.blockdevices[0].mountpoints = None;
         assert!(require_system_device(&listing.blockdevices).is_err());
         assert!(require_system_device(&[]).is_err());
+    }
+
+    #[test]
+    fn composefs_root_protects_backing_disk() {
+        let listing: Listing = serde_json::from_str(
+            r#"{"blockdevices":[
+            {"name":"sda","type":"disk","children":[
+                {"name":"sda1","type":"part","mountpoints":["/sysroot"]}]},
+            {"name":"sdb","type":"disk","tran":"usb"}]}"#,
+        )
+        .unwrap();
+        let composefs = "42 1 0:42 / / ro - overlay composefs ro";
+        assert!(require_system_device_with_mountinfo(&listing.blockdevices, composefs).is_ok());
+        assert!(listing.blockdevices[0].holds_system());
+        assert!(!listing.blockdevices[1].holds_system());
+        assert!(require_system_device_with_mountinfo(
+            &listing.blockdevices,
+            "42 1 0:42 / / ro - overlay overlay ro"
+        )
+        .is_err());
+        assert!(require_system_device_with_mountinfo(&listing.blockdevices[1..], composefs).is_err());
     }
 
     #[test]
