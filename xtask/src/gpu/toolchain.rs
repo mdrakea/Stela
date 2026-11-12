@@ -218,8 +218,8 @@ impl Toolchain {
         let toolchain = Self {
             clang: tools::which("clang").context("install Clang")?,
             clangxx: tools::which("clang++").context("install Clang's C++ compiler")?,
-            linker: tool("gcc-ld/ld.lld"),
-            archiver: tool("llvm-ar"),
+            linker: tools::which("ld.lld").unwrap_or(tool("gcc-ld/ld.lld")),
+            archiver: tools::which("llvm-ar").unwrap_or(tool("llvm-ar")),
         };
         for path in [&toolchain.linker, &toolchain.archiver] {
             ensure!(
